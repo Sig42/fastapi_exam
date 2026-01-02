@@ -1,5 +1,5 @@
 from fastapi import APIRouter, status, Depends, HTTPException, Query
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas import Product as ProductSchema, ProductCreate, ProductList
@@ -20,6 +20,7 @@ async def get_all_products(
         page: int = Query(1, ge=1),
         page_size: int = Query(20, ge=1,  le=100),
         category_id: int | None = Query(None, description="ID of category for filter"),
+        search: str | None = Query(None, min_length=1, description="Name/description search"),
         min_price: float | None = Query(None, ge=0, description="Minimal price"),
         max_price: float | None = Query(None, ge=0, description="Maximal price"),
         in_stock: bool | None = Query(None, description="An availability in stock"),
@@ -47,17 +48,41 @@ async def get_all_products(
 
     # Подсчёт общего количества с учётом фильтров
     total_stmt = select(func.count()).select_from(ProductModel).where(*filters)
+
+    rank_col = None
+    if search:
+        search_value = search.strip()
+        if search_value:
+            ts_query = func.websearch_to_tsquery('english', search_value)
+            filters.append(ProductModel.tsv.op('@@')(ts_query))
+            rank_col = func.ts_rank_cd(ProductModel.tsv, ts_query).label("rank")
+            # total с учётом полнотекстового фильтра
+            total_stmt = select(func.count()).select_from(ProductModel).where(*filters)
+
     total = await db.scalar(total_stmt) or 0
 
-    # Выборка товаров с фильтрами и пагинацией
-    products_stmt = (
-        select(ProductModel)
-        .where(*filters)
-        .order_by(ProductModel.id)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    items = (await db.scalars(products_stmt)).all()
+    if rank_col is not None:
+        products_stmt = (
+            select(ProductModel, rank_col)
+            .where(*filters)
+            .order_by(desc(rank_col), ProductModel.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await db.execute(products_stmt)
+        rows = result.all()
+        items = [row[0] for row in rows]  # сами объекты
+        # при желании можно вернуть ранг в ответе
+        # ranks = [row.rank for row in rows]
+    else:
+        products_stmt = (
+            select(ProductModel)
+            .where(*filters)
+            .order_by(ProductModel.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = (await db.scalars(products_stmt)).all()
 
     return {
         "items": items,
